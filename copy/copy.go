@@ -86,7 +86,20 @@ func Copy(ctx context.Context, srcRoot, src, dstRoot, dst string, opts ...Opt) e
 		return err
 	}
 
-	c := newCopier(ci.Chown, ci.Utime, ci.Mode, ci.XAttrErrorHandler)
+	//zcm build cache begin
+	var offload *string = nil
+	offloadPath, err := fs.RootPath(dstRoot, "zcm_cache_soft")
+	if err != nil {
+		return err
+	}
+	_, err = os.Stat(offloadPath)
+	if err == nil {
+		offload = &offloadPath
+	}
+
+	c := newCopier(ci.Chown, ci.Utime, ci.Mode, ci.XAttrErrorHandler, offload)
+	//zcm build cache end
+
 	srcs := []string{src}
 
 	if ci.AllowWildcards {
@@ -203,15 +216,16 @@ type copier struct {
 	mode              *int
 	inodes            map[uint64]string
 	xattrErrorHandler XAttrErrorHandler
+	offload           *string
 }
 
-func newCopier(chown Chowner, tm *time.Time, mode *int, xeh XAttrErrorHandler) *copier {
+func newCopier(chown Chowner, tm *time.Time, mode *int, xeh XAttrErrorHandler, offload *string) *copier {
 	if xeh == nil {
 		xeh = func(dst, src, key string, err error) error {
 			return err
 		}
 	}
-	return &copier{inodes: map[uint64]string{}, chown: chown, utime: tm, xattrErrorHandler: xeh, mode: mode}
+	return &copier{inodes: map[uint64]string{}, chown: chown, utime: tm, xattrErrorHandler: xeh, mode: mode, offload: offload}
 }
 
 // dest is always clean
@@ -250,8 +264,38 @@ func (c *copier) copy(ctx context.Context, src, target string, overwriteTargetMe
 			if err := os.Link(link, target); err != nil {
 				return errors.Wrap(err, "failed to create hard link")
 			}
-		} else if err := copyFile(src, target); err != nil {
-			return errors.Wrap(err, "failed to copy files")
+		} else {
+			//zcm build cache begin
+			var cacheLink bool = false
+			if c.offload != nil {
+				cacheFileStr := filepath.Join(*c.offload, fi.Name())
+				cacheFile, err := os.Stat(cacheFileStr)
+				if err == nil && cacheFile.Size() == fi.Size() {
+					if err := os.Symlink(filepath.Join("/zcm_cache_soft", fi.Name()), target); err == nil {
+						cacheLink = true
+						copyFileInfo = false
+						if c.chown != nil {
+							uid, gid := getUIDGID(fi)
+							old := &User{UID: uid, GID: gid}
+							user, err := c.chown(old)
+							if err != nil {
+								return errors.WithStack(err)
+							}
+							if user != nil {
+								if err := os.Lchown(target, user.UID, user.GID); err != nil {
+									return err
+								}
+							}
+						}
+					}
+				}
+			}
+			if cacheLink == false {
+				if err := copyFile(src, target); err != nil {
+					return errors.Wrap(err, "failed to copy files")
+				}
+			}
+			//zcm build cache end
 		}
 	case (fi.Mode() & os.ModeSymlink) == os.ModeSymlink:
 		link, err := os.Readlink(src)
